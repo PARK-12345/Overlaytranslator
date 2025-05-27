@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/overlay_button_container"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content">
+
+    <ImageButton
+        android:id="@+id/overlay_button"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:src="@android:drawable/ic_menu_search"
+        android:background="@drawable/overlay_button_background"
+        android:contentDescription="Translate Button"
+        android:scaleType="centerInside"
+        android:padding="12dp"/>
+</FrameLayout>

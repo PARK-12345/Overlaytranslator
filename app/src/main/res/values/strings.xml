@@ -1,0 +1,91 @@
+<resources>
+    <string name="app_name">오버레이 번역기</string>
+    <string name="start_overlay">오버레이 시작</string>
+    <string name="stop_overlay">오버레이 중지</string>
+    <string name="settings">설정</string>
+    <string name="title_activity_settings">설정</string>
+
+    <string name="setting_section_translation_text_style">번역 텍스트 스타일</string>
+    <string name="setting_font_size">글꼴 크기</string>
+    <string name="setting_text_color">텍스트 색상</string>
+    <string name="setting_background_color">배경 색상</string>
+    <string name="setting_background_alpha">배경 투명도 (0-255)</string>
+    <string name="setting_line_spacing">줄 간격</string>
+    <string name="setting_text_alignment">텍스트 정렬</string>
+    <string-array name="text_alignment_entries">
+        <item>왼쪽</item>
+        <item>가운데</item>
+        <item>오른쪽</item>
+    </string-array>
+    <string-array name="text_alignment_values">
+        <item>LEFT</item>
+        <item>CENTER</item>
+        <item>RIGHT</item>
+    </string-array>
+
+    <string name="setting_section_api">API 설정</string>
+    <string name="setting_gemini_api_key">Gemini API 키</string>
+    <string name="setting_gemini_prompt">번역 지시 프롬프트</string>
+    <string name="default_gemini_prompt"></string>
+
+    <string name="setting_section_filter">필터링 설정</string>
+    <string name="setting_forbidden_keywords">금지 단어 (쉼표로 구분)</string>
+    <string name="setting_forbidden_keywords_hint">예: skip,log,auto</string>
+
+    <string name="setting_section_overlay_button">오버레이 버튼</string>
+    <string name="setting_button_size">버튼 크기 (dp)</string>
+    <string name="setting_capture_delay">캡처 지연 시간 (ms)</string>
+
+    <string name="setting_section_language">언어 설정</string>
+    <string name="setting_auto_detect_source_language">원본 언어 자동 감지</string>
+    <string name="setting_default_source_language">기본 원본 언어</string>
+    <string-array name="source_language_entries">
+        <item>일본어</item>
+        <item>영어</item>
+        <item>한국어 (테스트용)</item>
+    </string-array>
+    <string-array name="source_language_values">
+        <item>ja</item>
+        <item>en</item>
+        <item>ko</item>
+    </string-array>
+    <string name="default_target_language">ko</string>
+
+    <string name="notification_channel_name">오버레이 서비스</string>
+    <string name="notification_channel_description">화면 번역 오버레이 서비스 실행 중</string>
+    <string name="overlay_notification_title">오버레이 번역기 실행 중</string>
+    <string name="overlay_notification_text">탭하여 설정을 변경하거나 중지하세요.</string>
+
+    <string name="error_permission_draw_overlay">다른 앱 위에 그리기 권한이 거부되었습니다. 앱을 사용하려면 권한을 허용해주세요.</string>
+    <string name="permission_denied_notification">알림 권한이 거부되었습니다.</string>
+    <string name="media_projection_request_title">화면 녹화/전송 시작</string>
+    <string name="media_projection_request_text">화면 번역을 위해 화면 캡처를 시작합니다. 이 작업은 민감한 정보를 포함할 수 있습니다.</string>
+    <string name="error_media_projection_permission_denied">화면 캡처 권한이 거부되었거나 문제가 발생했습니다.</string>
+    <string name="error_media_projection_setup_failed">화면 캡처 설정에 실패했습니다. 서비스를 다시 시작해주세요.</string>
+    <string name="error_media_projection_not_ready">화면 캡처 기능이 준비되지 않았습니다. 권한을 확인해주세요.</string>
+
+    <string name="error_ocr_failed">텍스트를 인식하지 못했습니다.</string>
+    <string name="error_ocr_no_text_found">화면에서 텍스트를 찾지 못했습니다.</string>
+    <string name="error_translation_failed">번역에 실패했습니다.</string>
+    <string name="error_translation_failed_all">모든 텍스트 번역에 실패했습니다.</string>
+    <string name="error_no_translation_results">번역할 내용이 없거나, 번역 결과가 없습니다.</string>
+    <string name="error_api_key_not_set">Gemini API 키가 설정되지 않았습니다. 설정에서 API 키를 입력해주세요.</string>
+    <string name="error_unknown">알 수 없는 오류가 발생했습니다.</string>
+    <string name="error_capture_failed">화면 캡처에 실패했습니다.</string>
+    <string name="error_processing_capture">캡처 처리 중 오류 발생</string>
+    <string name="error_internal_translation_error">번역 중 내부 오류 발생</string>
+    <string name="error_foreground_service_start_failed">포그라운드 서비스 시작 실패</string>
+    <string name="error_service_not_ready_media_projection">서비스가 화면 캡처를 시작할 준비가 되지 않았습니다.</string>
+    <string name="error_service_not_ready_for_projection">서비스가 화면 캡처를 진행할 준비가 되지 않았습니다.</string>
+
+    <string name="overlay_button_tap_hint">탭: 번역 시작</string>
+    <string name="overlay_button_double_tap_hint">더블 탭: 번역 내용 숨기기/보이기</string>
+    <string name="overlay_button_long_press_hint">길게 누르기: 버튼 이동</string>
+    <string name="overlay_translations_hidden">번역 내용 숨김</string>
+    <string name="overlay_translations_shown">번역 내용 표시</string>
+    <string name="setting_gemini_model_name">Gemini 모델 이름</string>
+    <string name="setting_thinking_budget">2.5 Flash 모델용 Thinking Budget 기본값:null</string>
+    <string name="setting_thinking_budget_hint">Thinking Budget</string>
+    <string name="setting_temperature">Temperature (생성 다양성)</string>
+
+</resources>
