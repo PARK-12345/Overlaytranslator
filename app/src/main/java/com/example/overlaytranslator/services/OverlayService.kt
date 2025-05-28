@@ -28,6 +28,7 @@ import android.view.GestureDetector
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.view.WindowMetrics
@@ -53,12 +54,13 @@ import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+// import kotlinx.coroutines.async // Not used directly in this file after changes
+// import kotlinx.coroutines.awaitAll // Not used directly in this file after changes
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Collections // For synchronizedMap if needed
 import javax.inject.Inject
 import kotlin.math.max
 import kotlin.math.min
@@ -74,6 +76,11 @@ class OverlayService : Service() {
 
         var isRunning = false
             private set
+
+        // Default values for dynamic settings, actual values will be loaded from GeneralSettings
+        private const val DEFAULT_SIMILARITY_TOLERANCE_CONST = 2
+        private const val DEFAULT_MAX_CACHE_SIZE_CONST = 200
+        private const val SIMILARITY_SEARCH_RECENT_ITEMS = 10
     }
 
     @Inject
@@ -100,10 +107,8 @@ class OverlayService : Service() {
     private lateinit var translationOverlayParams: WindowManager.LayoutParams
     private val translatedTextViews = mutableListOf<TextView>()
 
-    private var initialButtonX = 0
-    private var initialButtonY = 0
-    private var initialTouchX = 0f
-    private var initialTouchY = 0f
+    private var initialButtonX = 0; private var initialButtonY = 0
+    private var initialTouchX = 0f; private var initialTouchY = 0f
     private var isMoving = false
 
     private lateinit var gestureDetector: GestureDetector
@@ -120,27 +125,51 @@ class OverlayService : Service() {
     private val REQUEST_BATCH_SEPARATOR = "\n\n"
     private val RESPONSE_SPLIT_REGEX = Regex("\n+")
 
+    // LRU Cache
+    // Consider making this thread-safe if accessed by multiple threads concurrently for modification.
+    // For now, modifications are happening within processAndTranslateOcrBlocks, which is a suspend function.
+    private val translationCache by lazy {
+        val initialCacheCapacity = currentGeneralSettings.maxCacheSize.coerceAtLeast(16) // Initial capacity for LinkedHashMap
+        object : LinkedHashMap<String, TranslatedTextElement>(initialCacheCapacity, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, TranslatedTextElement>?): Boolean {
+                val currentMaxCache = if (::currentGeneralSettings.isInitialized) {
+                    currentGeneralSettings.maxCacheSize
+                } else {
+                    DEFAULT_MAX_CACHE_SIZE_CONST
+                }
+                val shouldRemove = size > currentMaxCache.coerceAtLeast(1) // Ensure cache size is at least 1
+                if (shouldRemove) {
+                    Log.d(TAG, "Cache dynamic limit ($currentMaxCache) reached, removing eldest: ${eldest?.key?.take(30)}...")
+                }
+                return shouldRemove
+            }
+        }
+        // For thread safety if needed:
+        // Collections.synchronizedMap(object : LinkedHashMap<String, TranslatedTextElement>... )
+    }
+
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "OverlayService onCreate")
         isRunning = true
+        // Load settings first as other initializations might depend on them
+        loadAllSettings() // This loads currentGeneralSettings
         screenCaptureManager.initialize()
-        loadAllSettings()
         initializeOverlayButton()
         initializeTranslationOverlay()
         setupGestureDetector()
         observeSettingsChanges()
         createNotificationChannel()
         notification = createNotification()
-        Log.d(TAG, "Notification object created in onCreate.")
+        Log.d(TAG, "Notification object created. Initial cache capacity based on settings: ${currentGeneralSettings.maxCacheSize}")
     }
 
     private fun loadAllSettings() {
         currentTextStyle = settingsRepository.getTranslationTextStyle()
         currentButtonSettings = settingsRepository.getOverlayButtonSettings()
-        currentGeneralSettings = settingsRepository.getGeneralSettings()
-        Log.d(TAG, "Initial settings loaded. Button Settings: $currentButtonSettings")
+        currentGeneralSettings = settingsRepository.getGeneralSettings() // Crucial for cache initialization
+        Log.d(TAG, "Initial settings loaded. GeneralSettings: $currentGeneralSettings")
     }
 
     private fun observeSettingsChanges() {
@@ -154,22 +183,25 @@ class OverlayService : Service() {
             settingsRepository.overlayButtonSettingsFlow.collectLatest { settings ->
                 val oldSettings = currentButtonSettings
                 currentButtonSettings = settings
-                Log.d(TAG, "OverlayButtonSettings updated via flow: $settings")
-
-                if (oldSettings.size != settings.size) {
-                    updateOverlayButtonSize()
-                    if (::overlayButtonParams.isInitialized && overlayButtonView.isAttachedToWindow) {
-                        updateOverlayButtonSizeAndPosition(overlayButtonParams.x, overlayButtonParams.y)
-                    }
+                if (oldSettings.size != settings.size && ::overlayButtonView.isInitialized && overlayButtonView.isAttachedToWindow) {
+                    updateOverlayButtonSizeAndPosition(overlayButtonParams.x, overlayButtonParams.y)
                 }
             }
         }
         mainScope.launch {
             settingsRepository.generalSettingsFlow.collectLatest { settings ->
+                val oldGeneralSettings = currentGeneralSettings
                 currentGeneralSettings = settings
+                Log.d(TAG, "GeneralSettings updated: $settings")
+                // If cache size changed, the removeEldestEntry will handle it.
+                // If similarity tolerance changed, it will be used in the next check.
+                if (oldGeneralSettings.maxCacheSize != settings.maxCacheSize) {
+                    Log.d(TAG, "Max cache size changed from ${oldGeneralSettings.maxCacheSize} to ${settings.maxCacheSize}. Cache will adjust.")
+                }
             }
         }
     }
+
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -184,11 +216,21 @@ class OverlayService : Service() {
         val notificationIntent = Intent(this, MainActivity::class.java)
         val pendingIntentFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
         val pendingIntent = PendingIntent.getActivity(this, 0, notificationIntent, pendingIntentFlags)
+
+        val stopSelfIntent = Intent(this, OverlayService::class.java).apply {
+            action = "STOP_SERVICE_ACTION"
+        }
+        val stopSelfPendingIntent = PendingIntent.getService(this, 0, stopSelfIntent, pendingIntentFlags)
+
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle(getString(R.string.overlay_notification_title))
             .setContentText(getString(R.string.overlay_notification_text))
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentIntent(pendingIntent).setPriority(NotificationCompat.PRIORITY_LOW).setOngoing(true).build()
+            .setContentIntent(pendingIntent)
+            .addAction(R.drawable.ic_close_24, getString(R.string.action_stop_service), stopSelfPendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .build()
     }
 
     @SuppressLint("InflateParams", "ClickableViewAccessibility")
@@ -204,35 +246,25 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            var initialX = currentButtonSettings.lastX
-            var initialY = currentButtonSettings.lastY
+            var initialXPos = currentButtonSettings.lastX
+            var initialYPos = currentButtonSettings.lastY
             val refWidth = currentButtonSettings.referenceScreenWidth
             val refHeight = currentButtonSettings.referenceScreenHeight
-
             if (refWidth > 0 && refHeight > 0) {
                 val currentDisplayMetrics = getCurrentDisplayMetrics()
-                val currentDisplayWidth = currentDisplayMetrics.widthPixels
-                val currentDisplayHeight = currentDisplayMetrics.heightPixels
-
-                if (currentDisplayWidth > 0 && currentDisplayHeight > 0) {
-                    val xRatio = initialX.toFloat() / refWidth.toFloat()
-                    val yRatio = initialY.toFloat() / refHeight.toFloat()
-                    initialX = (xRatio * currentDisplayWidth).toInt()
-                    initialY = (yRatio * currentDisplayHeight).toInt()
+                if (currentDisplayMetrics.widthPixels > 0 && currentDisplayMetrics.heightPixels > 0) {
+                    initialXPos = (initialXPos.toFloat() / refWidth * currentDisplayMetrics.widthPixels).toInt()
+                    initialYPos = (initialYPos.toFloat() / refHeight * currentDisplayMetrics.heightPixels).toInt()
                 }
             }
-            x = initialX
-            y = initialY
+            x = initialXPos; y = initialYPos
         }
         updateOverlayButtonSize()
 
         val currentScreenMetrics = getCurrentDisplayMetrics()
-        val screenWidthForClamp = currentScreenMetrics.widthPixels
-        val screenHeightForClamp = currentScreenMetrics.heightPixels
-
         if (overlayButtonParams.width > 0 && overlayButtonParams.height > 0) {
-            overlayButtonParams.x = max(0, min(overlayButtonParams.x, screenWidthForClamp - overlayButtonParams.width))
-            overlayButtonParams.y = max(0, min(overlayButtonParams.y, screenHeightForClamp - overlayButtonParams.height))
+            overlayButtonParams.x = max(0, min(overlayButtonParams.x, currentScreenMetrics.widthPixels - overlayButtonParams.width))
+            overlayButtonParams.y = max(0, min(overlayButtonParams.y, currentScreenMetrics.heightPixels - overlayButtonParams.height))
         }
 
         try {
@@ -261,7 +293,7 @@ class OverlayService : Service() {
                         overlayButtonParams.x = initialButtonX + (event.rawX - initialTouchX).toInt()
                         overlayButtonParams.y = initialButtonY + (event.rawY - initialTouchY).toInt()
                         try { windowManager.updateViewLayout(overlayButtonView, overlayButtonParams) }
-                        catch (e: Exception) { Log.e(TAG, "Error updating button view layout during move", e) }
+                        catch (e: Exception) { Log.w(TAG, "Error updating button view layout during move", e) }
                     }
                 }
                 MotionEvent.ACTION_UP -> {
@@ -285,31 +317,24 @@ class OverlayService : Service() {
         if (!::overlayButtonView.isInitialized || !overlayButtonView.isAttachedToWindow) return
         updateOverlayButtonSize()
 
-        val finalX = newX ?: overlayButtonParams.x
-        val finalY = newY ?: overlayButtonParams.y
-
-        overlayButtonParams.x = finalX
-        overlayButtonParams.y = finalY
+        overlayButtonParams.x = newX ?: overlayButtonParams.x
+        overlayButtonParams.y = newY ?: overlayButtonParams.y
 
         val currentScreenMetrics = getCurrentDisplayMetrics()
-        val screenWidth = currentScreenMetrics.widthPixels
-        val screenHeight = currentScreenMetrics.heightPixels
         if (overlayButtonParams.width > 0 && overlayButtonParams.height > 0) {
-            overlayButtonParams.x = max(0, min(overlayButtonParams.x, screenWidth - overlayButtonParams.width))
-            overlayButtonParams.y = max(0, min(overlayButtonParams.y, screenHeight - overlayButtonParams.height))
+            overlayButtonParams.x = max(0, min(overlayButtonParams.x, currentScreenMetrics.widthPixels - overlayButtonParams.width))
+            overlayButtonParams.y = max(0, min(overlayButtonParams.y, currentScreenMetrics.heightPixels - overlayButtonParams.height))
         }
-
-        try {
-            windowManager.updateViewLayout(overlayButtonView, overlayButtonParams)
-        } catch (e: Exception) { Log.e(TAG, "Error updating overlay button size/position", e) }
+        try { windowManager.updateViewLayout(overlayButtonView, overlayButtonParams) }
+        catch (e: Exception) { Log.w(TAG, "Error updating overlay button size/position", e) }
     }
 
 
     private fun updateOverlayButtonSize() {
         if (!::overlayButtonBinding.isInitialized) return
         val sizeInPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, currentButtonSettings.size.toFloat(), resources.displayMetrics).toInt()
-        val lp = overlayButtonBinding.overlayButton.layoutParams.apply { width = sizeInPx; height = sizeInPx }
-        overlayButtonBinding.overlayButton.layoutParams = lp
+        overlayButtonBinding.overlayButton.layoutParams.apply { width = sizeInPx; height = sizeInPx }
+        overlayButtonBinding.overlayButton.requestLayout()
 
         if (::overlayButtonParams.isInitialized) {
             overlayButtonParams.width = sizeInPx
@@ -339,15 +364,13 @@ class OverlayService : Service() {
                 handleSingleTap()
                 return true
             }
-
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 Log.d(TAG, "onDoubleTap")
                 handleDoubleTap()
                 return true
             }
-
             override fun onLongPress(e: MotionEvent) {
-                Log.d(TAG, "onLongPress")
+                Log.d(TAG, "onLongPress - Start moving button")
                 isMoving = true
             }
         })
@@ -357,25 +380,20 @@ class OverlayService : Service() {
         if (!isForegroundServiceSuccessfullyStartedWithType) { Toast.makeText(this, getString(R.string.error_service_not_ready_media_projection), Toast.LENGTH_LONG).show(); return }
         if (!screenCaptureManager.isMediaProjectionReady()) { Toast.makeText(this, getString(R.string.error_media_projection_not_ready), Toast.LENGTH_LONG).show(); sendBroadcast(Intent(ACTION_REQUEST_MEDIA_PROJECTION)); return }
 
-        // 싱글 탭 시에는 항상 번역 내용이 보이도록 플래그를 초기화
         areTranslationsTemporarilyHidden = false
-        Log.d(TAG, "Translations will be shown on this single tap.")
-
-        // 1. 버튼 및 번역 오버레이 숨김
         overlayButtonView.visibility = View.GONE
-        translationOverlayView.visibility = View.GONE // 새로운 번역을 위해 기존 번역은 숨김
-        Log.d(TAG, "Overlays hidden for new capture.")
+        clearTranslationOverlay()
+        Log.d(TAG, "Overlays hidden for new capture. Translations will be shown.")
 
-        // 2. 사용자가 설정한 캡처 지연 시간 후 화면 캡처
         handler.postDelayed({
             if (screenCaptureManager.isCapturing()) {
+                Log.w(TAG, "Capture requested but already capturing. Aborting new capture.")
                 if (overlayButtonView.visibility == View.GONE) overlayButtonView.visibility = View.VISIBLE
                 return@postDelayed
             }
-            Log.d(TAG, "After user's captureDelayMs (${currentGeneralSettings.captureDelayMs}ms). Performing screen capture.")
+            Log.d(TAG, "Delay ended (${currentGeneralSettings.captureDelayMs}ms). Performing screen capture.")
             performScreenCapture()
-
-        }, currentGeneralSettings.captureDelayMs.toLong())
+        }, currentGeneralSettings.captureDelayMs.toLong().coerceAtLeast(0)) // Ensure delay is not negative
     }
 
     private fun performScreenCapture() {
@@ -383,178 +401,60 @@ class OverlayService : Service() {
             mainScope.launch {
                 try {
                     if (bitmap != null) {
+                        Log.d(TAG, "Screen capture successful. Bitmap received.")
                         processCapturedImage(bitmap)
                     } else {
                         Log.e(TAG, "Screen capture failed, bitmap is null.")
                         Toast.makeText(this@OverlayService, R.string.error_capture_failed, Toast.LENGTH_SHORT).show()
-                        clearTranslationOverlay() // 이전 번역 내용 클리어
                         if (overlayButtonView.visibility == View.GONE) overlayButtonView.visibility = View.VISIBLE
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error processing captured image or displaying results", e)
+                    Log.e(TAG, "Error in performScreenCapture's mainScope.launch", e)
                     Toast.makeText(this@OverlayService, "${getString(R.string.error_processing_capture)}: ${e.message}", Toast.LENGTH_SHORT).show()
-                    clearTranslationOverlay() // 이전 번역 내용 클리어
                     if (overlayButtonView.visibility == View.GONE) overlayButtonView.visibility = View.VISIBLE
+                    if (bitmap != null && !bitmap.isRecycled) bitmap.recycle()
                 }
             }
         }
     }
 
     private suspend fun processCapturedImage(bitmap: Bitmap) {
-        val ocrResult = withContext(Dispatchers.IO) {
-            val ocrSourceLanguage = if (currentGeneralSettings.autoDetectSourceLanguage) null else currentGeneralSettings.defaultSourceLanguage
-            ocrManager.recognizeText(bitmap, ocrSourceLanguage)
-        }
-
-        ocrResult.fold(
-            onSuccess = { initialOcrTextBlocks ->
-                if (initialOcrTextBlocks.isEmpty()) {
-                    Log.d(TAG, "OCR found no text blocks.")
-                    withContext(Dispatchers.Main) { clearTranslationOverlay() } // 이전 번역 내용 클리어
-                    if (!bitmap.isRecycled) bitmap.recycle()
-                    if (overlayButtonView.visibility == View.GONE) overlayButtonView.visibility = View.VISIBLE
-                } else {
-                    Log.d(TAG, "OCR successful, ${initialOcrTextBlocks.size} blocks found. Starting translation.")
-                    translateOcrResults(initialOcrTextBlocks, bitmap)
-                }
-            },
-            onFailure = { e ->
-                Log.e(TAG, "OCR failed", e)
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@OverlayService, R.string.error_ocr_failed, Toast.LENGTH_SHORT).show()
-                    clearTranslationOverlay() // 이전 번역 내용 클리어
-                }
-                if (!bitmap.isRecycled) bitmap.recycle()
-                if (overlayButtonView.visibility == View.GONE) overlayButtonView.visibility = View.VISIBLE
-            }
-        )
-    }
-
-    private suspend fun translateOcrResults(initialOcrTextBlocks: List<OcrTextBlock>, originalBitmap: Bitmap) {
         var bitmapHandled = false
         try {
-            if (currentGeneralSettings.geminiApiKey.isBlank()) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@OverlayService, R.string.error_api_key_not_set, Toast.LENGTH_LONG).show()
-                    clearTranslationOverlay() // 이전 번역 내용 클리어
-                }
-                if (!originalBitmap.isRecycled) originalBitmap.recycle()
-                bitmapHandled = true
-                return
-            }
+            val ocrSourceLanguage = if (currentGeneralSettings.autoDetectSourceLanguage) null else currentGeneralSettings.defaultSourceLanguage
+            val ocrResult = ocrManager.recognizeText(bitmap, ocrSourceLanguage)
 
-            val validBlocksForBatch = mutableListOf<OcrTextBlock>()
-            val singleLineTextsForBatch = mutableListOf<String>()
-
-            for (block in initialOcrTextBlocks) {
-                val processedTextForBatchSegment = block.text.replace('\n', ' ').trim()
-                if (processedTextForBatchSegment.isNotEmpty()) {
-                    validBlocksForBatch.add(block)
-                    singleLineTextsForBatch.add(processedTextForBatchSegment)
-                }
-            }
-
-            if (singleLineTextsForBatch.isEmpty()) {
-                Log.d(TAG, "No valid text segments for batch translation after preprocessing.")
-                withContext(Dispatchers.Main) { clearTranslationOverlay() } // 이전 번역 내용 클리어
-                if (!originalBitmap.isRecycled) originalBitmap.recycle()
-                bitmapHandled = true
-                return
-            }
-
-            val combinedTextForBatching = singleLineTextsForBatch.joinToString(REQUEST_BATCH_SEPARATOR)
-            val numSegmentsSent = singleLineTextsForBatch.size
-            val targetLang = currentGeneralSettings.targetLanguage
-
-            Log.d(TAG, "Attempting batch translation for $numSegmentsSent OCR blocks (sent as $numSegmentsSent segments separated by '$REQUEST_BATCH_SEPARATOR'). Combined text: \"$combinedTextForBatching\"")
-
-            val sourceLangForBatch = if (currentGeneralSettings.autoDetectSourceLanguage) null else currentGeneralSettings.defaultSourceLanguage
-            val batchTranslationResult = translationManager.translateText(
-                combinedTextForBatching,
-                sourceLangForBatch,
-                targetLang,
-                isBatchedRequest = true
-            )
-
-            batchTranslationResult.fold(
-                onSuccess = { batchedTranslatedString ->
-                    Log.d(TAG, "Batch translation API response (raw): \"$batchedTranslatedString\"")
-                    val translatedApiSegmentsProvisional = batchedTranslatedString.split(RESPONSE_SPLIT_REGEX)
-                    val translatedApiSegments = translatedApiSegmentsProvisional.map { it.trim() }.filter { it.isNotBlank() }
-
-                    Log.d(TAG, "Batch translation - OCR blocks sent: $numSegmentsSent, API returned non-blank segments after splitting by REGEX '$RESPONSE_SPLIT_REGEX' and filtering: ${translatedApiSegments.size}")
-                    translatedApiSegments.forEachIndexed { index, segment -> Log.d(TAG, "API Segment $index: \"$segment\"") }
-
-                    val translatedElements = mutableListOf<TranslatedTextElement>()
-
-                    if (numSegmentsSent == 1 && translatedApiSegments.isNotEmpty()) {
-                        Log.d(TAG, "Single OCR block sent. Joining ${translatedApiSegments.size} API segments for it using '\\n'.")
-                        val singleBlockTranslation = translatedApiSegments.joinToString("\n").trim()
-                        val originalBlock = validBlocksForBatch[0]
-                        val actualSourceLanguage = determineActualSourceLanguage(originalBlock, currentGeneralSettings)
-                        translatedElements.add(
-                            TranslatedTextElement(
-                                originalText = originalBlock.text,
-                                translatedText = singleBlockTranslation,
-                                originalBoundingBox = originalBlock.boundingBox,
-                                sourceLanguage = actualSourceLanguage,
-                                targetLanguage = targetLang
-                            )
-                        )
-                        withContext(Dispatchers.Main) { displayTranslatedTexts(translatedElements) }
-                        if (!originalBitmap.isRecycled) originalBitmap.recycle()
-                        bitmapHandled = true
-                    } else if (translatedApiSegments.size == numSegmentsSent) {
-                        Log.d(TAG, "Multiple OCR blocks sent, and API segment count matches after splitting by REGEX and filtering.")
-                        for (i in 0 until numSegmentsSent) {
-                            val originalBlock = validBlocksForBatch[i]
-                            val translatedTextSegment = translatedApiSegments[i]
-                            val actualSourceLanguage = determineActualSourceLanguage(originalBlock, currentGeneralSettings)
-                            translatedElements.add(
-                                TranslatedTextElement(
-                                    originalText = originalBlock.text,
-                                    translatedText = translatedTextSegment,
-                                    originalBoundingBox = originalBlock.boundingBox,
-                                    sourceLanguage = actualSourceLanguage,
-                                    targetLanguage = targetLang
-                                )
-                            )
-                        }
-                        withContext(Dispatchers.Main) { displayTranslatedTexts(translatedElements) }
-                        if (!originalBitmap.isRecycled) originalBitmap.recycle()
-                        bitmapHandled = true
+            ocrResult.fold(
+                onSuccess = { staticallyFilteredOcrBlocks ->
+                    if (staticallyFilteredOcrBlocks.isEmpty()) {
+                        Log.d(TAG, "OCR (static filtered) found no text blocks.")
+                        withContext(Dispatchers.Main) { clearTranslationOverlay() }
+                        // Bitmap will be handled in finally block if not already
                     } else {
-                        Log.w(TAG, "Batch translation segment count mismatch. OCR blocks sent: $numSegmentsSent, API non-blank segments: ${translatedApiSegments.size}. API Response (raw): \"$batchedTranslatedString\". Falling back to individual translation.")
-                        translateIndividually(validBlocksForBatch, targetLang, originalBitmap)
-                        bitmapHandled = true
+                        Log.d(TAG, "OCR (static filtered) successful, ${staticallyFilteredOcrBlocks.size} blocks. Starting dynamic filtering & translation.")
+                        processAndTranslateOcrBlocks(staticallyFilteredOcrBlocks) // Pass bitmap to be handled by this function
+                        // processAndTranslateOcrBlocks will handle the bitmap
+                        bitmapHandled = true // Mark as handled as it's passed down
                     }
                 },
                 onFailure = { e ->
-                    Log.e(TAG, "Batch translation API call failed. Falling back.", e)
-                    if (e is ApiKeyNotSetException) {
-                        withContext(Dispatchers.Main) { Toast.makeText(this@OverlayService, R.string.error_api_key_not_set, Toast.LENGTH_LONG).show(); clearTranslationOverlay() }
-                        if (!originalBitmap.isRecycled) originalBitmap.recycle()
-                        bitmapHandled = true
-                    } else {
-                        translateIndividually(validBlocksForBatch, targetLang, originalBitmap)
-                        bitmapHandled = true
+                    Log.e(TAG, "OCR (static filtered) failed", e)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@OverlayService, R.string.error_ocr_failed, Toast.LENGTH_SHORT).show()
+                        clearTranslationOverlay()
                     }
                 }
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Exception in translateOcrResults", e)
+            Log.e(TAG, "Exception in processCapturedImage", e) // Catch exceptions from ocrManager or fold
             withContext(Dispatchers.Main) {
-                Toast.makeText(this@OverlayService, "${getString(R.string.error_internal_translation_error)}: ${e.message}", Toast.LENGTH_SHORT).show()
-                clearTranslationOverlay() // 이전 번역 내용 클리어
-            }
-            if (!bitmapHandled && !originalBitmap.isRecycled) {
-                originalBitmap.recycle()
-                bitmapHandled = true
+                Toast.makeText(this@OverlayService, "${getString(R.string.error_processing_capture)} (Outer): ${e.message}", Toast.LENGTH_SHORT).show()
+                clearTranslationOverlay()
             }
         } finally {
-            if (!bitmapHandled && !originalBitmap.isRecycled) {
-                Log.w(TAG, "Bitmap was not handled earlier in translateOcrResults or its calls, recycling in finally.")
-                originalBitmap.recycle()
+            if (!bitmapHandled && !bitmap.isRecycled) {
+                Log.w(TAG, "Bitmap was not handled in processCapturedImage, recycling in finally.")
+                bitmap.recycle()
             }
             withContext(Dispatchers.Main) {
                 if (overlayButtonView.visibility == View.GONE) {
@@ -565,80 +465,123 @@ class OverlayService : Service() {
     }
 
 
-    private suspend fun translateIndividually(
-        blocksToTranslate: List<OcrTextBlock>,
-        targetLang: String,
-        bitmapToRecycle: Bitmap?
+    private suspend fun processAndTranslateOcrBlocks(
+        staticallyFilteredBlocks: List<OcrTextBlock>
+        // originalBitmapForRecycle: Bitmap // No longer needed here, handled by caller's finally
     ) {
-        Log.d(TAG, "Executing individual translation for ${blocksToTranslate.size} blocks.")
-        val translatedElements = mutableListOf<TranslatedTextElement>()
-        var apiKeyErrorOccurred = false
+        val finalTranslatedElements = mutableListOf<TranslatedTextElement>()
+        val blocksToTranslateApi = mutableListOf<OcrTextBlock>()
+        // val blockIndexMap = mutableMapOf<OcrTextBlock, Int>() // Not strictly needed if order is maintained
 
-        try {
-            val translationJobs = blocksToTranslate.map { block ->
-                ioScope.async {
-                    val textForIndividualTranslation = block.text.replace('\n', ' ').trim()
-                    if (textForIndividualTranslation.isEmpty()) return@async null
+        staticallyFilteredBlocks.forEach { block -> // Removed index as it's not used for now
+            val originalTextKey = block.text
+            var foundInCache = false
 
-                    val sourceLangForIndividual = if (currentGeneralSettings.autoDetectSourceLanguage) block.languageCode else currentGeneralSettings.defaultSourceLanguage
-                    translationManager.translateText(
-                        textForIndividualTranslation,
-                        sourceLangForIndividual,
-                        targetLang,
-                        isBatchedRequest = false
-                    ).fold(
-                        onSuccess = { translatedText ->
-                            val actualSourceLanguage = determineActualSourceLanguage(block, currentGeneralSettings)
-                            TranslatedTextElement(
-                                originalText = block.text,
-                                translatedText = translatedText.trim(),
-                                originalBoundingBox = block.boundingBox,
-                                sourceLanguage = actualSourceLanguage,
-                                targetLanguage = targetLang
-                            )
-                        },
-                        onFailure = { e ->
-                            if (e is ApiKeyNotSetException) apiKeyErrorOccurred = true
-                            Log.e(TAG, "Individual translation failed for block: '${block.text}'", e)
-                            null
-                        }
-                    )
-                }
-            }
-            val results = translationJobs.awaitAll()
-
-            if (apiKeyErrorOccurred) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@OverlayService, R.string.error_api_key_not_set, Toast.LENGTH_LONG).show()
-                    clearTranslationOverlay() // 이전 번역 내용 클리어
-                }
-                return
+            // 1. Exact cache hit
+            translationCache[originalTextKey]?.let { cachedElement -> // 'get' updates access order
+                Log.d(TAG, "Exact cache hit for: \"${originalTextKey.take(30)}...\"")
+                finalTranslatedElements.add(cachedElement.copy(originalBoundingBox = block.boundingBox))
+                foundInCache = true
             }
 
-            results.filterNotNull().forEach { translatedElements.add(it) }
+            // 2. Similar cache hit (if not exact match)
+            if (!foundInCache) {
+                // Iterate a limited number of recent items for similarity check.
+                // A more robust way for "recent" would be a separate list or a custom LRU that exposes recency.
+                // For simplicity, we iterate a portion of the cache. This is not strictly LRU order for similarity.
+                val cacheEntries = synchronized(translationCache) { translationCache.entries.toList() } // Snapshot for thread safety
+                val recentEntries = cacheEntries.takeLast(SIMILARITY_SEARCH_RECENT_ITEMS)
 
-            withContext(Dispatchers.Main) {
-                if (translatedElements.isNotEmpty()) {
-                    displayTranslatedTexts(translatedElements)
-                } else {
-                    clearTranslationOverlay() // 이전 번역 내용 클리어
-                    if (blocksToTranslate.any { it.text.replace('\n', ' ').trim().isNotEmpty() }) {
-                        Toast.makeText(this@OverlayService, R.string.error_translation_failed_all, Toast.LENGTH_SHORT).show()
+                for (entry in recentEntries.reversed()) { // Check most recent of this subset first
+                    val cachedKey = entry.key
+                    val cachedElement = entry.value // No need to call get() again on translationCache here
+
+                    val langHintForSimilarity = if (currentGeneralSettings.autoDetectSourceLanguage) block.languageCode else currentGeneralSettings.defaultSourceLanguage
+                    val tolerance = currentGeneralSettings.similarityTolerance.coerceAtLeast(0)
+
+                    if (ocrManager.areTextsSimilar(originalTextKey, cachedKey, langHintForSimilarity, tolerance)) {
+                        Log.d(TAG, "Similar cache hit: \"${originalTextKey.take(30)}...\" similar to \"${cachedKey.take(30)}...\"")
+                        // Important: Update access order for the actual found key in the main cache
+                        translationCache[cachedKey] // Access the original cache to update LRU order
+                        finalTranslatedElements.add(cachedElement.copy(originalBoundingBox = block.boundingBox))
+                        foundInCache = true
+                        break
                     }
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception during individual translations", e)
-            withContext(Dispatchers.Main) {
-                Toast.makeText(this@OverlayService, R.string.error_translation_failed_all, Toast.LENGTH_SHORT).show()
-                clearTranslationOverlay() // 이전 번역 내용 클리어
+
+            if (!foundInCache) {
+                blocksToTranslateApi.add(block)
+                // blockIndexMap[block] = index // If reordering is complex later
             }
-        } finally {
-            bitmapToRecycle?.let {
-                if (!it.isRecycled) {
-                    Log.d(TAG, "Recycling bitmap in translateIndividually finally block.")
-                    it.recycle()
-                }
+        }
+        Log.d(TAG, "Cache lookup complete. Found in cache (exact or similar): ${finalTranslatedElements.size}. To translate via API: ${blocksToTranslateApi.size}")
+
+        if (blocksToTranslateApi.isNotEmpty()) {
+            if (currentGeneralSettings.geminiApiKey.isBlank()) {
+                withContext(Dispatchers.Main) { Toast.makeText(this@OverlayService, R.string.error_api_key_not_set, Toast.LENGTH_LONG).show() }
+            } else {
+                val singleLineTextsForBatch = blocksToTranslateApi.map { it.text.replace('\n', ' ').trim() }
+                val combinedTextForBatching = singleLineTextsForBatch.joinToString(REQUEST_BATCH_SEPARATOR)
+                val numSegmentsSent = singleLineTextsForBatch.size
+                val targetLang = currentGeneralSettings.targetLanguage
+                val sourceLangForBatch = if (currentGeneralSettings.autoDetectSourceLanguage) null else currentGeneralSettings.defaultSourceLanguage
+
+                Log.d(TAG, "Attempting API batch translation for ${blocksToTranslateApi.size} blocks.")
+                val batchTranslationResult = translationManager.translateText(
+                    combinedTextForBatching, sourceLangForBatch, targetLang, isBatchedRequest = true
+                )
+
+                batchTranslationResult.fold(
+                    onSuccess = { batchedTranslatedString ->
+                        val translatedApiSegments = batchedTranslatedString.split(RESPONSE_SPLIT_REGEX).map { it.trim() }.filter { it.isNotBlank() }
+                        Log.d(TAG, "API Batch translation success. Sent $numSegmentsSent, Got ${translatedApiSegments.size} segments.")
+
+                        if (translatedApiSegments.size == numSegmentsSent) {
+                            blocksToTranslateApi.forEachIndexed { i, originalBlock ->
+                                val translatedText = translatedApiSegments[i]
+                                val actualSourceLang = determineActualSourceLanguage(originalBlock, currentGeneralSettings)
+                                val newElement = TranslatedTextElement(
+                                    originalText = originalBlock.text,
+                                    translatedText = translatedText,
+                                    originalBoundingBox = originalBlock.boundingBox,
+                                    sourceLanguage = actualSourceLang,
+                                    targetLanguage = targetLang
+                                )
+                                finalTranslatedElements.add(newElement) // Add to list for display
+                                translationCache[originalBlock.text] = newElement // Store in cache
+                            }
+                        } else {
+                            Log.w(TAG, "Batch translation segment count mismatch. Sent: $numSegmentsSent, Got: ${translatedApiSegments.size}. Some translations might be missing or incorrect.")
+                            // Handle mismatch: could try to map what we have, or show error, or fallback to individual.
+                            // For now, we'll try to map as many as possible if API gives fewer, or use only the first N if API gives more.
+                            val commonCount = min(translatedApiSegments.size, blocksToTranslateApi.size)
+                            for (i in 0 until commonCount) {
+                                val originalBlock = blocksToTranslateApi[i]
+                                val translatedText = translatedApiSegments[i]
+                                val actualSourceLang = determineActualSourceLanguage(originalBlock, currentGeneralSettings)
+                                val newElement = TranslatedTextElement(originalBlock.text, translatedText, originalBlock.boundingBox, actualSourceLang, targetLang)
+                                finalTranslatedElements.add(newElement)
+                                translationCache[originalBlock.text] = newElement
+                            }
+                        }
+                    },
+                    onFailure = { e ->
+                        Log.e(TAG, "API Batch translation failed.", e)
+                        val toastMessage = if (e is ApiKeyNotSetException) R.string.error_api_key_not_set else R.string.error_translation_failed_all
+                        withContext(Dispatchers.Main) { Toast.makeText(this@OverlayService, toastMessage, Toast.LENGTH_LONG).show() }
+                    }
+                )
+            }
+        }
+
+        // Ensure elements are displayed on the main thread
+        withContext(Dispatchers.Main) {
+            if (finalTranslatedElements.isNotEmpty()) {
+                displayTranslatedTexts(finalTranslatedElements)
+            } else {
+                Log.d(TAG, "No text to display after dynamic filtering and translation.")
+                clearTranslationOverlay()
             }
         }
     }
@@ -646,7 +589,7 @@ class OverlayService : Service() {
 
     private fun determineActualSourceLanguage(block: OcrTextBlock, settings: GeneralSettings): String {
         return if (settings.autoDetectSourceLanguage) {
-            block.languageCode ?: "und"
+            block.languageCode?.takeIf { it.isNotBlank() && it != "und" } ?: settings.defaultSourceLanguage
         } else {
             settings.defaultSourceLanguage
         }
@@ -660,37 +603,36 @@ class OverlayService : Service() {
     }
 
     private fun displayTranslatedTexts(translatedElements: List<TranslatedTextElement>) {
-        clearTranslationOverlay() // 새로운 내용을 표시하기 전에 이전 내용을 확실히 제거
+        clearTranslationOverlay() // Clear previous before drawing new
         val container = translationOverlayBinding.translationOverlayContainer ?: return
+
         val currentOrientation = resources.configuration.orientation
         val statusBarHeight = getStatusBarHeight()
 
-        Log.d(TAG, "Displaying ${translatedElements.size} translated elements. Orientation: $currentOrientation, SBH: $statusBarHeight. areTranslationsTemporarilyHidden: $areTranslationsTemporarilyHidden")
+        // FIX: Use windowManager to get display rotation
+        @Suppress("DEPRECATION")
+        val displayRotation = windowManager.defaultDisplay.rotation // Consistently use windowManager
+
+        Log.d(TAG, "Displaying ${translatedElements.size} translated elements. Orientation: $currentOrientation, Rotation: $displayRotation, SBH: $statusBarHeight. Hidden: $areTranslationsTemporarilyHidden")
 
         for (el in translatedElements) {
             TextView(this).apply {
                 text = el.translatedText
                 textSize = currentTextStyle.fontSize ?: TranslationTextStyle().fontSize ?: 16f
-                try {
-                    setTextColor(Color.parseColor(currentTextStyle.textColor))
-                } catch (e: IllegalArgumentException) {
-                    Log.w(TAG, "Invalid text color format: ${currentTextStyle.textColor}", e)
-                    setTextColor(Color.WHITE)
-                }
+                try { setTextColor(Color.parseColor(currentTextStyle.textColor)) }
+                catch (e: IllegalArgumentException) { setTextColor(Color.WHITE); Log.w(TAG, "Invalid text color: ${currentTextStyle.textColor}", e) }
                 try {
                     val bg = Color.parseColor(currentTextStyle.backgroundColor)
                     setBackgroundColor(Color.argb(currentTextStyle.backgroundAlpha, Color.red(bg), Color.green(bg), Color.blue(bg)))
                 } catch (e: IllegalArgumentException) {
-                    Log.w(TAG, "Invalid background color format: ${currentTextStyle.backgroundColor}", e)
-                    setBackgroundColor(Color.argb(currentTextStyle.backgroundAlpha, 0, 0, 0))
+                    setBackgroundColor(Color.argb(currentTextStyle.backgroundAlpha, 0, 0, 0)); Log.w(TAG, "Invalid background color: ${currentTextStyle.backgroundColor}", e)
                 }
                 setLineSpacing(currentTextStyle.lineSpacingExtra ?: TranslationTextStyle().lineSpacingExtra ?: 4f, 1.0f)
                 gravity = currentTextStyle.textAlignment
                 setPadding(10, 0, 10, 5)
 
                 layoutParams = FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT
+                    FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
                     val originalBox = el.originalBoundingBox
                     var finalLeftMargin = originalBox.left
@@ -698,21 +640,22 @@ class OverlayService : Service() {
 
                     if (currentOrientation == Configuration.ORIENTATION_PORTRAIT) {
                         finalTopMargin -= statusBarHeight
-                    } else {
-                        finalLeftMargin -= statusBarHeight
+                    } else if (currentOrientation == Configuration.ORIENTATION_LANDSCAPE) {
+                        if (displayRotation == Surface.ROTATION_90) {
+                            finalLeftMargin -= statusBarHeight
+                        }
+                        // ROTATION_270 (camera right landscape) typically doesn't need status bar adjustment for left margin
                     }
-
                     leftMargin = max(0, finalLeftMargin)
                     topMargin = max(0, finalTopMargin)
                 }
-                // areTranslationsTemporarilyHidden 플래그에 따라 alpha 값 설정 (handleSingleTap에서 false로 설정됨)
                 alpha = if (areTranslationsTemporarilyHidden) 0.0f else 1.0f
             }.also {
                 container.addView(it)
                 translatedTextViews.add(it)
             }
         }
-        translationOverlayView.visibility = View.VISIBLE // 번역 내용 표시
+        translationOverlayView.visibility = View.VISIBLE
     }
 
 
@@ -730,7 +673,6 @@ class OverlayService : Service() {
             }
             tv.setLineSpacing(currentTextStyle.lineSpacingExtra ?: TranslationTextStyle().lineSpacingExtra ?: 4f, 1.0f)
             tv.gravity = currentTextStyle.textAlignment
-            // 스타일 업데이트 시에도 areTranslationsTemporarilyHidden 상태를 반영
             tv.alpha = if (areTranslationsTemporarilyHidden) 0.0f else 1.0f
         }
     }
@@ -738,7 +680,7 @@ class OverlayService : Service() {
     private fun clearTranslationOverlay() {
         translationOverlayBinding.translationOverlayContainer?.removeAllViews()
         translatedTextViews.clear()
-        translationOverlayView.visibility = View.GONE // 번역 오버레이 숨김
+        translationOverlayView.visibility = View.GONE
         Log.d(TAG, "Translation overlay cleared and hidden.")
     }
 
@@ -746,9 +688,7 @@ class OverlayService : Service() {
         if (translationOverlayView.visibility == View.VISIBLE && translatedTextViews.isNotEmpty()) {
             areTranslationsTemporarilyHidden = !areTranslationsTemporarilyHidden
             val newAlpha = if (areTranslationsTemporarilyHidden) 0.0f else 1.0f
-            for (tv in translatedTextViews) {
-                tv.alpha = newAlpha
-            }
+            for (tv in translatedTextViews) { tv.alpha = newAlpha }
             Log.d(TAG, "Double tap: translations visibility toggled to ${if(areTranslationsTemporarilyHidden) "hidden" else "visible"}")
         } else {
             Log.d(TAG, "Double tap: No translations to toggle or overlay not visible.")
@@ -786,13 +726,11 @@ class OverlayService : Service() {
                         } catch (e: Exception) {
                             Log.e(TAG, "Error starting foreground service with media projection type", e)
                             Toast.makeText(this, getString(R.string.error_foreground_service_start_failed) + ": " + e.message, Toast.LENGTH_LONG).show()
-                            stopSelf()
-                            return START_NOT_STICKY
+                            stopSelf(); return START_NOT_STICKY
                         }
                     } ?: run {
                         Log.e(TAG, "Notification object was null, cannot start foreground service.")
-                        stopSelf()
-                        return START_NOT_STICKY
+                        stopSelf(); return START_NOT_STICKY
                     }
                 }
 
@@ -800,25 +738,42 @@ class OverlayService : Service() {
                     if (!screenCaptureManager.handleMediaProjectionResult(resultCode, data)) {
                         Log.e(TAG, "Failed to setup media projection with ScreenCaptureManager.")
                         Toast.makeText(this, R.string.error_media_projection_setup_failed, Toast.LENGTH_LONG).show()
-                        stopSelf()
-                        return START_NOT_STICKY
+                        stopSelf(); return START_NOT_STICKY
                     }
                     Log.d(TAG, "Media projection result handled by ScreenCaptureManager.")
                 } else {
                     Log.w(TAG, "Foreground service was not ready when media projection result was being handled.")
                     Toast.makeText(this, R.string.error_service_not_ready_for_projection, Toast.LENGTH_LONG).show()
-                    stopSelf()
-                    return START_NOT_STICKY
+                    stopSelf(); return START_NOT_STICKY
                 }
             } else {
                 Log.w(TAG, "Media projection permission denied or data is null.")
                 Toast.makeText(this, R.string.error_media_projection_permission_denied, Toast.LENGTH_LONG).show()
-                stopSelf()
-                return START_NOT_STICKY
+                stopSelf(); return START_NOT_STICKY
+            }
+        } else if (!isForegroundServiceSuccessfullyStartedWithType && notification != null) {
+            Log.d(TAG, "Starting foreground service (general type or media projection type if Q+ and permission already granted).")
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // For Q+, if media projection permission is expected later, startForeground with type
+                    // is typically done *after* permission is granted.
+                    // If starting before permission, a general type might be safer, or no type.
+                    // However, the current logic correctly starts with type *after* getting result code.
+                    // This path is for when service starts without media projection intent (e.g. app launch).
+                    startForeground(NOTIFICATION_ID, notification!!) // General start
+                } else {
+                    startForeground(NOTIFICATION_ID, notification!!)
+                }
+                // isForegroundServiceSuccessfullyStartedWithType is set true only after media projection is confirmed.
+            } catch (e: Exception) {
+                Log.e(TAG, "Error starting foreground service (general)", e)
+                Toast.makeText(this, getString(R.string.error_foreground_service_start_failed) + ": " + e.message, Toast.LENGTH_LONG).show()
+                stopSelf(); return START_NOT_STICKY
             }
         }
         return START_STICKY
     }
+
 
     override fun onBind(intent: Intent): IBinder = OverlayBinder()
     inner class OverlayBinder : Binder() { fun getService(): OverlayService = this@OverlayService }
@@ -850,30 +805,22 @@ class OverlayService : Service() {
         val newScreenMetrics = getCurrentDisplayMetrics()
         val newScreenWidth = newScreenMetrics.widthPixels
         val newScreenHeight = newScreenMetrics.heightPixels
-        Log.d(TAG, "onConfigurationChanged: New screen dimensions (px): ${newScreenWidth}x${newScreenHeight}")
 
-        val screenDpi: Int = newScreenMetrics.densityDpi
         if (::screenCaptureManager.isInitialized) {
-            screenCaptureManager.updateScreenParameters(newScreenWidth, newScreenHeight, screenDpi)
+            screenCaptureManager.updateScreenParameters(newScreenWidth, newScreenHeight, newScreenMetrics.densityDpi)
         }
 
         val refX = currentButtonSettings.lastX
         val refY = currentButtonSettings.lastY
         val refWidth = currentButtonSettings.referenceScreenWidth
         val refHeight = currentButtonSettings.referenceScreenHeight
-
         var newButtonX = overlayButtonParams.x
         var newButtonY = overlayButtonParams.y
 
         if (refWidth > 0 && refHeight > 0 && newScreenWidth > 0 && newScreenHeight > 0) {
-            val xRatio = refX.toFloat() / refWidth.toFloat()
-            val yRatio = refY.toFloat() / refHeight.toFloat()
-            newButtonX = (xRatio * newScreenWidth).toInt()
-            newButtonY = (yRatio * newScreenHeight).toInt()
-        } else {
-            Log.w(TAG, "Reference dimensions for button not valid. Using current absolute X/Y for clamping: $newButtonX, $newButtonY.")
+            newButtonX = (refX.toFloat() / refWidth * newScreenWidth).toInt()
+            newButtonY = (refY.toFloat() / refHeight * newScreenHeight).toInt()
         }
-
         updateOverlayButtonSizeAndPosition(newButtonX, newButtonY)
 
         settingsRepository.saveOverlayButtonPosition(
@@ -884,22 +831,27 @@ class OverlayService : Service() {
         )
 
         if (translationOverlayView.visibility == View.VISIBLE && translatedTextViews.isNotEmpty()) {
-            Log.d(TAG, "Configuration changed, clearing existing translations.")
+            Log.d(TAG, "Configuration changed, clearing existing translations to re-evaluate positions.")
             clearTranslationOverlay()
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "OverlayService onDestroy")
+        Log.d(TAG, "OverlayService onDestroy. Cache size: ${translationCache.size}")
         isRunning = false
         try {
             if (::overlayButtonView.isInitialized && overlayButtonView.isAttachedToWindow) windowManager.removeView(overlayButtonView)
             if (::translationOverlayView.isInitialized && translationOverlayView.isAttachedToWindow) windowManager.removeView(translationOverlayView)
-        } catch (e: Exception) { Log.e(TAG, "Error removing overlay views during onDestroy", e) }
+        } catch (e: Exception) { Log.w(TAG, "Error removing overlay views during onDestroy", e) }
+
         serviceJob.cancel()
         handler.removeCallbacksAndMessages(null)
         if (::screenCaptureManager.isInitialized) screenCaptureManager.stopCapture()
+
+        synchronized(translationCache) { // Synchronize access if clearing from a different thread context potentially
+            translationCache.clear()
+        }
         isForegroundServiceSuccessfullyStartedWithType = false
         Log.d(TAG, "OverlayService fully destroyed and cleaned up.")
     }

@@ -29,7 +29,7 @@
                 android:id="@+id/editTextFontSize"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:inputType="number" />
+                android:inputType="numberDecimal" />
         </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
@@ -65,19 +65,27 @@
             android:layout_height="wrap_content"
             android:text="@string/setting_background_alpha"
             android:layout_marginTop="8dp"/>
-        <SeekBar
-            android:id="@+id/seekBarBackgroundAlpha"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:max="255"
-            android:progress="128"
-            android:layout_marginBottom="8dp"/>
-        <TextView
-            android:id="@+id/textViewBackgroundAlphaValue"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="128"
-            android:layout_gravity="end"/>
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+            <SeekBar
+                android:id="@+id/seekBarBackgroundAlpha"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:max="255"
+                android:progress="200" />
+            <TextView
+                android:id="@+id/textViewBackgroundAlphaValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="30dp"
+                android:gravity="end"
+                android:text="200"
+                android:layout_marginStart="8dp"/>
+        </LinearLayout>
 
 
         <com.google.android.material.textfield.TextInputLayout
@@ -117,6 +125,7 @@
             android:layout_height="wrap_content"
             android:hint="@string/setting_gemini_api_key"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            app:passwordToggleEnabled="true"
             android:layout_marginBottom="8dp">
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/editTextGeminiApiKey"
@@ -136,34 +145,34 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:inputType="text"
-                android:text="gemini-2.0-flash"/> </com.google.android.material.textfield.TextInputLayout>
+                android:text="gemini-2.0-flash"/>
+        </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="@string/setting_thinking_budget"
+            android:hint="@string/setting_thinking_budget_optional"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
             android:layout_marginBottom="8dp">
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/editTextThinkingBudget"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:inputType="number"
-                android:hint="@string/setting_thinking_budget_hint" />
+                android:inputType="number" />
         </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="@string/setting_temperature"
+            android:hint="@string/setting_temperature_optional"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
             android:layout_marginBottom="16dp">
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/editTextTemperature"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:inputType="numberDecimal"
-                android:text="0.3" /> </com.google.android.material.textfield.TextInputLayout>
+                android:inputType="numberDecimal" />
+        </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
@@ -185,7 +194,7 @@
             style="?android:attr/listSeparatorTextViewStyle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/setting_section_filter"
+            android:text="@string/setting_section_filter_cache"
             android:layout_marginBottom="8dp"/>
 
         <com.google.android.material.textfield.TextInputLayout
@@ -193,7 +202,7 @@
             android:layout_height="wrap_content"
             android:hint="@string/setting_forbidden_keywords"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
-            android:layout_marginBottom="16dp">
+            android:layout_marginBottom="8dp">
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/editTextForbiddenKeywords"
                 android:layout_width="match_parent"
@@ -201,6 +210,35 @@
                 android:inputType="text"
                 android:hint="@string/setting_forbidden_keywords_hint" />
         </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/setting_similarity_tolerance"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_marginBottom="8dp">
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/editTextSimilarityTolerance"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:text="2"/>
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/setting_max_cache_size"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_marginBottom="16dp">
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/editTextMaxCacheSize"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:text="200"/>
+        </com.google.android.material.textfield.TextInputLayout>
+
 
         <TextView
             style="?android:attr/listSeparatorTextViewStyle"
@@ -212,7 +250,7 @@
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="@string/setting_button_size"
+            android:hint="@string/setting_button_size_dp"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
             android:layout_marginBottom="8dp">
             <com.google.android.material.textfield.TextInputEditText
@@ -225,7 +263,7 @@
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="@string/setting_capture_delay"
+            android:hint="@string/setting_capture_delay_ms"
             style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
             android:layout_marginBottom="16dp">
             <com.google.android.material.textfield.TextInputEditText
@@ -247,7 +285,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/setting_auto_detect_source_language"
-            android:checked="true"
             android:layout_marginBottom="8dp"/>
 
         <TextView
@@ -266,7 +303,8 @@
             android:id="@+id/buttonSaveSettings"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="설정 저장"/>
+            android:text="@string/action_save_settings"
+            android:layout_marginTop="16dp"/>
 
     </LinearLayout>
 </ScrollView>

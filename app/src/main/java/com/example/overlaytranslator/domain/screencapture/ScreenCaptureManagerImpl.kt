@@ -1,5 +1,6 @@
 package com.example.overlaytranslator.domain.screencapture
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -13,9 +14,11 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Surface
 import android.view.WindowManager
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -29,212 +32,243 @@ class ScreenCaptureManagerImpl @Inject constructor(
 
     companion object {
         private const val TAG = "ScreenCaptureManager"
-        private const val VIRTUAL_DISPLAY_NAME = "ScreenCaptureVirtualDisplay"
+        private const val VIRTUAL_DISPLAY_NAME = "ScreenCaptureVD"
+        private const val CAPTURE_TIMEOUT_MS = 2500L // 캡처 타임아웃 시간 (5초)
     }
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var windowManager: WindowManager? = null
-    private var displayMetrics: DisplayMetrics = DisplayMetrics() // Non-null, initialized in init
+    private var displayMetrics: DisplayMetrics = DisplayMetrics()
 
     private var isInitialized = false
+    @Volatile
     private var isCurrentlyCapturingImage = false
-    private val handler = Handler(Looper.getMainLooper())
 
-    // Storing last projection result is not typically needed if MP is managed carefully
-    // private var lastResultCode: Int = Activity.RESULT_CANCELED
-    // private var lastData: Intent? = null
+    private var captureHandlerThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
 
     private var mediaProjectionCallback: MediaProjection.Callback? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun initialize() {
         if (isInitialized) {
-            Log.d(TAG, "Already initialized. Screen: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels} DPI: ${displayMetrics.densityDpi}")
+            // Log.d(TAG, "Already initialized.") // 너무 빈번할 수 있어 주석 처리
             return
         }
         windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-        // Initialize displayMetrics with current values
         updateDisplayMetrics()
 
-        Log.d(TAG, "ScreenCaptureManager initialized. Screen: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels} DPI: ${displayMetrics.densityDpi}")
+        captureHandlerThread = HandlerThread("ScreenCaptureThread").apply {
+            start()
+            captureHandler = Handler(looper)
+        }
+        Log.d(TAG, "ScreenCaptureManager initialized. Capture HandlerThread started.")
         isInitialized = true
     }
 
     private fun updateDisplayMetrics() {
         val wm = windowManager ?: (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).also { windowManager = it }
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val currentMetrics = wm.currentWindowMetrics
             displayMetrics.widthPixels = currentMetrics.bounds.width()
             displayMetrics.heightPixels = currentMetrics.bounds.height()
-            // For densityDpi, it's better to rely on configuration or resources.displayMetrics
-            // as WindowMetrics might not provide it directly in all scenarios or might reflect raw display DPI.
-            // Using resources.configuration.densityDpi ensures it matches app's view rendering.
             displayMetrics.densityDpi = context.resources.configuration.densityDpi
-            displayMetrics.density = displayMetrics.densityDpi.toFloat() / DisplayMetrics.DENSITY_DEFAULT
         } else {
             @Suppress("DEPRECATION")
-            wm.defaultDisplay?.getRealMetrics(displayMetrics) // Use getRealMetrics for more accuracy
+            wm.defaultDisplay?.getRealMetrics(displayMetrics)
         }
+        displayMetrics.density = displayMetrics.densityDpi.toFloat() / DisplayMetrics.DENSITY_DEFAULT
 
         if (displayMetrics.widthPixels == 0 || displayMetrics.heightPixels == 0) {
-            Log.e(TAG, "Failed to get valid display metrics from WindowManager. Using resource displayMetrics as fallback.")
-            val resourceMetrics = context.resources.displayMetrics
-            displayMetrics.widthPixels = resourceMetrics.widthPixels
-            displayMetrics.heightPixels = resourceMetrics.heightPixels
-            displayMetrics.density = resourceMetrics.density
-            displayMetrics.densityDpi = resourceMetrics.densityDpi
+            Log.e(TAG, "Failed to get valid display metrics. Using resource metrics as fallback.")
+            context.resources.displayMetrics.let {
+                displayMetrics.widthPixels = it.widthPixels
+                displayMetrics.heightPixels = it.heightPixels
+                displayMetrics.density = it.density
+                displayMetrics.densityDpi = it.densityDpi
+            }
         }
+        Log.d(TAG, "DisplayMetrics updated: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels} DPI ${displayMetrics.densityDpi}")
     }
-
 
     override fun requestScreenCapturePermission(activity: Activity, requestCode: Int) {
         if (!isInitialized) initialize()
-        activity.startActivityForResult(mediaProjectionManager.createScreenCaptureIntent(), requestCode)
-        Log.d(TAG, "MediaProjection permission request sent via Activity.")
+        try {
+            activity.startActivityForResult(mediaProjectionManager.createScreenCaptureIntent(), requestCode)
+            Log.d(TAG, "MediaProjection permission request sent.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting screen capture permission intent", e)
+            // Consider notifying the user or service
+        }
     }
 
     override fun handleMediaProjectionResult(resultCode: Int, data: Intent?): Boolean {
-        Log.d(TAG, "handleMediaProjectionResult called. ResultCode: $resultCode, Data: ${data != null}")
-        if (!isInitialized) initialize() // Ensure metrics are up-to-date
+        Log.d(TAG, "handleMediaProjectionResult. ResultCode: $resultCode, Data: ${data != null}")
+        if (!isInitialized) initialize()
 
         if (resultCode == Activity.RESULT_OK && data != null) {
-            releaseMediaProjection() // Release any existing projection first
+            releaseMediaProjection() // 이전 프로젝션과 관련 리소스 정리
 
             mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
             if (mediaProjection == null) {
                 Log.e(TAG, "Failed to get MediaProjection from result data.")
                 return false
             }
-            Log.i(TAG, "New MediaProjection obtained successfully: ${mediaProjection.hashCode()}")
+            Log.i(TAG, "New MediaProjection obtained: ${mediaProjection.hashCode()}")
 
             mediaProjectionCallback = object : MediaProjection.Callback() {
                 override fun onStop() {
-                    Log.w(TAG, "MediaProjection stopped by system or user (Callback). MP: ${mediaProjection.hashCode()}")
-                    releaseVirtualDisplayAndReader() // VD and IR depend on MP
-                    mediaProjection = null // Nullify after stopping and releasing dependents
-                    // No need to unregister callback from itself, but good practice to nullify the reference
-                    mediaProjectionCallback = null
+                    Log.w(TAG, "MediaProjection stopped (Callback). MP Hash: ${mediaProjection?.hashCode()}")
+                    mainHandler.post {
+                        releaseVirtualDisplayAndReader() // VD와 IR은 MP에 의존
+                        mediaProjection = null
+                        mediaProjectionCallback = null
+                    }
                 }
             }
-            mediaProjection?.registerCallback(mediaProjectionCallback!!, handler)
+            mediaProjection?.registerCallback(mediaProjectionCallback!!, mainHandler)
 
+            // 새 MediaProjection 토큰으로 VirtualDisplay 및 ImageReader 설정 시도
             return setupVirtualDisplayAndReader()
         } else {
             Log.w(TAG, "MediaProjection request denied or failed. ResultCode: $resultCode")
-            releaseAllCaptureResources() // Ensure everything is clean
+            releaseAllCaptureResources() // 모든 것 정리
             return false
         }
     }
 
-    // ✨ 새 메서드 구현 ✨
     override fun updateScreenParameters(newWidth: Int, newHeight: Int, newDpi: Int) {
-        Log.d(TAG, "updateScreenParameters called with: Width=$newWidth, Height=$newHeight, DPI=$newDpi")
-        if (newWidth == 0 || newHeight == 0 || newDpi == 0) {
-            Log.e(TAG, "Invalid screen parameters received: $newWidth, $newHeight, $newDpi. Aborting update.")
+        Log.d(TAG, "updateScreenParameters: W=$newWidth, H=$newHeight, DPI=$newDpi")
+        if (newWidth <= 0 || newHeight <= 0 || newDpi <= 0) {
+            Log.e(TAG, "Invalid screen parameters: $newWidth, $newHeight, $newDpi. Update aborted.")
             return
         }
-
         if (!isInitialized) {
             Log.w(TAG, "Manager not initialized during updateScreenParameters. Initializing first.")
             initialize()
         }
 
-        // Update the stored displayMetrics
+        val oldWidth = displayMetrics.widthPixels
+        val oldHeight = displayMetrics.heightPixels
+        // val oldDpi = displayMetrics.densityDpi // DPI 변경은 resize에서 처리
+
+        // displayMetrics 업데이트
         displayMetrics.widthPixels = newWidth
         displayMetrics.heightPixels = newHeight
         displayMetrics.densityDpi = newDpi
-        displayMetrics.density = newDpi.toFloat() / DisplayMetrics.DENSITY_DEFAULT // Recalculate density
+        displayMetrics.density = newDpi.toFloat() / DisplayMetrics.DENSITY_DEFAULT
+        Log.i(TAG, "Updated displayMetrics internally to: ${newWidth}x${newHeight} DPI $newDpi")
 
-        Log.i(TAG, "Updated displayMetrics to: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels} DPI: ${displayMetrics.densityDpi}")
-
-        // If MediaProjection is active, we need to update the VirtualDisplay and ImageReader
         val currentMediaProjection = mediaProjection
-        if (currentMediaProjection != null) {
-            if (virtualDisplay != null) {
-                Log.d(TAG, "MediaProjection and VirtualDisplay exist. Attempting resize and surface update.")
-                // Close existing ImageReader before creating a new one
-                imageReader?.close()
+        val currentVirtualDisplay = virtualDisplay
+        var currentImageReader = imageReader // var로 변경하여 재할당 가능하게
+
+        if (currentMediaProjection != null && currentVirtualDisplay != null && currentImageReader != null) {
+            // MediaProjection이 활성 상태이고, 기존 VD와 IR이 존재할 경우
+            Log.d(TAG, "Active MediaProjection. Attempting to update existing VirtualDisplay and ImageReader.")
+
+            // 크기가 실제로 변경되었는지 확인 (단순 DPI 변경은 resize만으로 충분할 수 있음)
+            if (oldWidth != newWidth || oldHeight != newHeight) {
+                Log.d(TAG, "Screen dimensions changed. Recreating ImageReader and resizing VirtualDisplay.")
                 try {
-                    imageReader = ImageReader.newInstance(newWidth, newHeight, PixelFormat.RGBA_8888, 2)
-                    Log.d(TAG, "New ImageReader created for update: ${imageReader.hashCode()} with new dimensions ${newWidth}x${newHeight}")
+                    // 1. 기존 ImageReader 닫기
+                    currentImageReader.setOnImageAvailableListener(null, null) // 리스너 먼저 제거
+                    currentImageReader.close()
 
-                    virtualDisplay?.resize(newWidth, newHeight, newDpi)
-                    Log.d(TAG, "VirtualDisplay resized to ${newWidth}x${newHeight} DPI ${newDpi}.")
+                    // 2. 새 크기로 ImageReader 재생성
+                    this.imageReader = ImageReader.newInstance(newWidth, newHeight, PixelFormat.RGBA_8888, 2)
+                    currentImageReader = this.imageReader // 참조 업데이트
+                    Log.d(TAG, "New ImageReader created: ${currentImageReader.hashCode()} with ${newWidth}x${newHeight}")
 
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) { // setSurface is API 28+
-                        imageReader?.surface?.let { newSurface ->
-                            virtualDisplay?.surface = newSurface
-                            Log.d(TAG, "New ImageReader surface set on VirtualDisplay.")
-                        } ?: Log.e(TAG, "New ImageReader surface is null after creation for update.")
+                    // 3. 기존 VirtualDisplay 리사이즈
+                    currentVirtualDisplay.resize(newWidth, newHeight, newDpi)
+                    Log.d(TAG, "Existing VirtualDisplay resized to ${newWidth}x${newHeight} DPI $newDpi.")
+
+                    // 4. VirtualDisplay에 새 Surface 설정 (API 28+)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        currentImageReader?.surface?.let { newSurface ->
+                            if (newSurface.isValid) {
+                                currentVirtualDisplay.surface = newSurface
+                                Log.d(TAG, "New ImageReader surface set on existing VirtualDisplay.")
+                            } else {
+                                Log.e(TAG, "New ImageReader surface is invalid. Capture may fail.")
+                                // 이 경우, 더 이상 진행하기 어려움. 서비스 재시작 유도 필요.
+                                stopCapture() // 현재 프로젝션 중단
+                                // TODO: 서비스에 알려서 MediaProjection 재요청하도록 하는 메커니즘 필요
+                            }
+                        } ?: Log.e(TAG, "New ImageReader surface is null. Cannot set on VirtualDisplay.")
                     } else {
-                        Log.w(TAG, "setSurface for VirtualDisplay not available below API 28. Full recreation might be needed if issues persist after resize.")
-                        // Fallback: Full re-setup if only resize is not enough.
-                        // This might lead to issues on API 34+ if createVirtualDisplay is called again on the same token.
-                        // However, our handleMediaProjectionResult always gets a fresh token.
-                        // If a single MP token is meant to live across rotations, this path is risky.
-                        // For now, assuming resize() is sufficient, or subsequent capture will fail and re-setup.
+                        Log.w(TAG, "setSurface for VirtualDisplay not available below API 28. Full MediaProjection restart might be needed for screen changes to take effect reliably.")
+                        // 이 경우, resize만으로는 부족할 수 있으며, 오래된 surface로 계속 작동할 수 있음.
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error updating existing VirtualDisplay/ImageReader components. Attempting full setup.", e)
-                    setupVirtualDisplayAndReader() // Fallback to full setup
+                    Log.e(TAG, "Error updating existing VirtualDisplay/ImageReader components.", e)
+                    // 업데이트 실패 시, 현재 프로젝션을 중단하고 사용자가 다시 시작하도록 유도하는 것이 안전할 수 있음.
+                    stopCapture() // 현재 프로젝션 중단
+                    // TODO: 서비스에 알려서 MediaProjection 재요청하도록 하는 메커니즘 필요
                 }
             } else {
-                // MediaProjection exists, but VirtualDisplay doesn't. This implies a need for initial setup.
-                Log.d(TAG, "MediaProjection exists, but VirtualDisplay is null. Calling setupVirtualDisplayAndReader.")
-                setupVirtualDisplayAndReader()
+                // 크기 변경 없이 DPI만 변경된 경우 (또는 변경 없는 호출)
+                // VirtualDisplay.resize()는 DPI도 업데이트하므로, ImageReader 재생성 없이 호출 가능
+                try {
+                    currentVirtualDisplay.resize(newWidth, newHeight, newDpi)
+                    Log.d(TAG, "Only DPI or no dimension change. VirtualDisplay resized for DPI: $newDpi")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error resizing VirtualDisplay for DPI update.", e)
+                }
             }
+        } else if (currentMediaProjection != null && (currentVirtualDisplay == null || currentImageReader == null)) {
+            // MediaProjection은 있지만 VD/IR이 없는 경우 (예: 이전 설정 실패)
+            // 이 MediaProjection 토큰으로 *처음* VD를 생성하는 것이므로 허용됨.
+            Log.d(TAG, "MediaProjection exists, but VD/IR are missing. Attempting initial setup.")
+            setupVirtualDisplayAndReader()
         } else {
-            Log.w(TAG, "MediaProjection not available during updateScreenParameters. New parameters are stored and will be used when MediaProjection is next set up.")
+            Log.w(TAG, "MediaProjection not available during updateScreenParameters. New parameters stored for next setup.")
         }
     }
 
 
+    @SuppressLint("WrongConstant")
     private fun setupVirtualDisplayAndReader(): Boolean {
-        val currentMediaProjection = mediaProjection
-        if (currentMediaProjection == null) {
-            Log.e(TAG, "Cannot setup VirtualDisplay: MediaProjection is null.")
+        val currentMediaProjection = mediaProjection ?: run {
+            Log.e(TAG, "setupVirtualDisplayAndReader: MediaProjection is null.")
             return false
         }
-        if (!isInitialized) {
-            Log.e(TAG, "Cannot setup VirtualDisplay: Manager not initialized (displayMetrics not ready).")
+        if (!isInitialized || captureHandler == null) {
+            Log.e(TAG, "setupVirtualDisplayAndReader: Manager not initialized or captureHandler is null.")
             return false
         }
 
-        releaseVirtualDisplayAndReader() // Clean up previous instances first
+        releaseVirtualDisplayAndReader() // 이전 인스턴스 정리
 
         val width = displayMetrics.widthPixels
         val height = displayMetrics.heightPixels
         val density = displayMetrics.densityDpi
 
         if (width <= 0 || height <= 0) {
-            Log.e(TAG, "Invalid dimensions for VirtualDisplay setup: ${width}x${height}. Attempting to update metrics again.")
-            updateDisplayMetrics() // Try to get fresh metrics
+            Log.e(TAG, "Invalid dimensions for VirtualDisplay setup: ${width}x${height}. Attempting metrics update.")
+            updateDisplayMetrics()
             if (displayMetrics.widthPixels <= 0 || displayMetrics.heightPixels <= 0) {
                 Log.e(TAG, "Still invalid dimensions after metrics update. Aborting VD setup.")
                 return false
             }
-            // Use the freshly updated metrics
-            val newWidth = displayMetrics.widthPixels
-            val newHeight = displayMetrics.heightPixels
-            Log.w(TAG, "Retrying VD setup with re-fetched dimensions: ${newWidth}x${newHeight}")
+            // Log.w(TAG, "Retrying VD setup with re-fetched dimensions: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels}")
+            // 재귀 호출 대신, 업데이트된 displayMetrics를 바로 사용
         }
 
-
-        Log.d(TAG, "Setting up VirtualDisplay with dimensions: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels} DPI: ${displayMetrics.densityDpi}")
-
+        Log.d(TAG, "Setting up VirtualDisplay with: ${displayMetrics.widthPixels}x${displayMetrics.heightPixels} DPI $density")
         try {
-            imageReader = ImageReader.newInstance(displayMetrics.widthPixels, displayMetrics.heightPixels, PixelFormat.RGBA_8888, 2 /* maxImages */)
-            Log.d(TAG, "ImageReader created: ${imageReader.hashCode()} for MediaProjection ${currentMediaProjection.hashCode()}")
+            imageReader = ImageReader.newInstance(displayMetrics.widthPixels, displayMetrics.heightPixels, PixelFormat.RGBA_8888, 2)
+            Log.d(TAG, "ImageReader created: ${imageReader.hashCode()} for MP ${currentMediaProjection.hashCode()}")
 
             virtualDisplay = currentMediaProjection.createVirtualDisplay(
                 VIRTUAL_DISPLAY_NAME,
-                displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.densityDpi,
+                displayMetrics.widthPixels, displayMetrics.heightPixels, density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader!!.surface, // imageReader is guaranteed non-null here
-                null, handler // Using a handler for callbacks can be useful
+                imageReader!!.surface,
+                null, captureHandler
             )
             if (virtualDisplay == null) {
                 Log.e(TAG, "Failed to create VirtualDisplay (returned null).")
@@ -244,179 +278,169 @@ class ScreenCaptureManagerImpl @Inject constructor(
             Log.i(TAG, "VirtualDisplay (${virtualDisplay.hashCode()}) and ImageReader created successfully.")
             return true
         } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException while creating VirtualDisplay. This might happen if MediaProjection token is reused incorrectly (Android 14+).", e)
+            Log.e(TAG, "SecurityException creating VirtualDisplay. (API 34+ restriction? Token: ${currentMediaProjection.hashCode()})", e)
             releaseVirtualDisplayAndReader()
-            // Consider stopping the MediaProjection itself as it might be in an invalid state for reuse.
-            // mediaProjection?.stop(); mediaProjection = null; // This would require re-requesting permission.
+            // 이 경우, MediaProjection 토큰이 이미 사용되었거나 유효하지 않을 수 있음.
+            // 상위(서비스)에서 MediaProjection을 다시 요청해야 할 수 있음을 알려야 함.
+            mediaProjection?.stop() // 현재 MediaProjection을 중지하여 재사용 방지
+            mediaProjection = null
             return false
         } catch (e: Exception) {
-            Log.e(TAG, "Exception while creating VirtualDisplay or ImageReader", e)
+            Log.e(TAG, "Exception during VirtualDisplay/ImageReader setup", e)
             releaseVirtualDisplayAndReader()
             return false
         }
     }
 
     override fun captureScreen(callback: (Bitmap?) -> Unit) {
-        if (!isInitialized) {
-            Log.e(TAG, "captureScreen: Not initialized."); initialize()
-            if (!isInitialized) { callback(null); return }
-        }
-        if (mediaProjection == null) {
-            Log.e(TAG, "captureScreen: MediaProjection is null."); callback(null); return
-        }
-        if (virtualDisplay == null || imageReader == null) {
-            Log.w(TAG, "captureScreen: VirtualDisplay or ImageReader not ready. Attempting setup.")
-            if (!setupVirtualDisplayAndReader()) {
-                Log.e(TAG, "captureScreen: Failed to setup VD/IR for capture."); callback(null); return
-            }
-            // After setup, check again.
-            if (virtualDisplay == null || imageReader == null) {
-                Log.e(TAG, "captureScreen: VD/IR still null after setup attempt."); callback(null); return
-            }
+        if (!isMediaProjectionReady()) {
+            Log.e(TAG, "captureScreen: Not ready. MP: ${mediaProjection != null}, VD: ${virtualDisplay != null}, IR: ${imageReader != null}, Surface: ${imageReader?.surface?.isValid}")
+            // 준비 안된 경우, setup 시도 (주의: setupVirtualDisplayAndReader는 createVirtualDisplay 호출)
+            // 이 경로는 handleMediaProjectionResult에서 이미 setup을 시도했어야 함.
+            // 여기서 다시 setup을 시도하는 것은 API 34+에서 문제를 일으킬 수 있음.
+            // 따라서, isMediaProjectionReady가 false면 즉시 실패 처리하는 것이 더 안전할 수 있음.
+            // 또는, OverlayService에서 isMediaProjectionReady를 먼저 확인하고, false면 권한 재요청 유도.
+            // 여기서는 일단 실패 콜백.
+            callback(null); return
         }
 
         if (isCurrentlyCapturingImage) {
-            Log.w(TAG, "captureScreen: Already capturing. Ignoring subsequent request."); return
+            Log.w(TAG, "captureScreen: Already capturing. Ignoring request.")
+            return
         }
         isCurrentlyCapturingImage = true
-        Log.d(TAG, "Attempting capture. VD: ${virtualDisplay?.hashCode()}, IR: ${imageReader?.hashCode()}")
+        // Log.d(TAG, "Starting screen capture. IR: ${imageReader?.hashCode()}")
 
         val currentImageReader = imageReader ?: run {
-            Log.e(TAG, "captureScreen: ImageReader became null unexpectedly before setting listener.");
+            Log.e(TAG, "captureScreen: ImageReader is null.");
             isCurrentlyCapturingImage = false; callback(null); return
         }
-        Log.d(TAG, "Preparing ImageReader for capture: ${currentImageReader.hashCode()}. Surface valid: ${currentImageReader.surface?.isValid}")
+        val currentCaptureHandler = captureHandler ?: run {
+            Log.e(TAG, "captureScreen: CaptureHandler is null.");
+            isCurrentlyCapturingImage = false; callback(null); return
+        }
 
         try {
-            // Clear any stale images from the reader's queue before setting the new listener.
-            // This is important if images might have been produced between captures or during setup.
-            var imageToClear: Image?
-            var clearedCount = 0
-            do {
-                imageToClear = currentImageReader.acquireNextImage() // Drains queue one by one
-                if (imageToClear != null) {
-                    imageToClear.close()
-                    clearedCount++
-                }
-            } while (imageToClear != null)
-
-            if (clearedCount > 0) {
-                Log.d(TAG, "Cleared $clearedCount pre-existing image(s) from ImageReader before capture.")
+            var staleImage: Image?; var clearedCount = 0
+            while (currentImageReader.acquireNextImage().also { staleImage = it } != null) {
+                staleImage?.close(); clearedCount++
             }
-        } catch (e: IllegalStateException) {
-            Log.e(TAG, "IllegalStateException while trying to clear ImageReader queue before capture. It might be closed.", e)
-            isCurrentlyCapturingImage = false; callback(null); return
-        } catch (e: Exception) {
-            Log.w(TAG, "Exception while trying to clear ImageReader queue before capture", e)
+            if (clearedCount > 0) Log.d(TAG, "Cleared $clearedCount stale images.")
+        } catch (e: Exception) { Log.w(TAG, "Exception clearing stale images.", e) }
+
+        val timeoutRunnable = Runnable {
+            if (isCurrentlyCapturingImage) {
+                Log.w(TAG, "Capture timeout (${CAPTURE_TIMEOUT_MS}ms). Resetting.")
+                currentImageReader.setOnImageAvailableListener(null, null)
+                isCurrentlyCapturingImage = false
+                mainHandler.post { callback(null) }
+            }
         }
+        currentCaptureHandler.postDelayed(timeoutRunnable, CAPTURE_TIMEOUT_MS)
 
         currentImageReader.setOnImageAvailableListener(object : ImageReader.OnImageAvailableListener {
-            private var imageProcessed = false // Ensure callback is invoked only once per capture request
-
+            private var imageAcquired = false
             override fun onImageAvailable(reader: ImageReader) {
-                if (imageProcessed) { // If already processed an image for this capture, ignore further availability
+                if (imageAcquired || !isCurrentlyCapturingImage) {
                     try { reader.acquireLatestImage()?.close() } catch (e: Exception) { /* ignore */ }
                     return
                 }
-                var image: Image? = null
-                var bitmap: Bitmap? = null
+                var image: Image? = null; var bitmap: Bitmap? = null
                 try {
-                    image = reader.acquireLatestImage() // Get the latest image
+                    image = reader.acquireLatestImage()
                     if (image != null) {
-                        imageProcessed = true // Mark as processed for this specific capture call
-                        Log.d(TAG, "Image acquired from IR: ${reader.hashCode()}. Timestamp: ${image.timestamp}, WxH: ${image.width}x${image.height}")
-                        val planes = image.planes
-                        val buffer = planes[0].buffer
-                        val pixelStride = planes[0].pixelStride
-                        val rowStride = planes[0].rowStride
+                        imageAcquired = true
+                        currentCaptureHandler.removeCallbacks(timeoutRunnable)
+                        // Log.d(TAG, "Image acquired: ${image.width}x${image.height}")
+
+                        val planes = image.planes; val buffer = planes[0].buffer
+                        val pixelStride = planes[0].pixelStride; val rowStride = planes[0].rowStride
                         val rowPadding = rowStride - pixelStride * image.width
 
-                        // Create bitmap with correct width, then copy from buffer
                         val tempBitmap = Bitmap.createBitmap(image.width + rowPadding / pixelStride, image.height, Bitmap.Config.ARGB_8888)
                         tempBitmap.copyPixelsFromBuffer(buffer)
-
-                        // If there was row padding, crop the bitmap to the actual image width
-                        bitmap = if (rowPadding == 0 && tempBitmap.width == image.width && tempBitmap.height == image.height) {
-                            tempBitmap
-                        } else {
+                        bitmap = if (rowPadding == 0 && tempBitmap.width == image.width) tempBitmap else {
                             Bitmap.createBitmap(tempBitmap, 0, 0, image.width, image.height).also {
-                                if (tempBitmap != it) tempBitmap.recycle() // recycle tempBitmap if a new one was created
+                                if (tempBitmap != it && !tempBitmap.isRecycled) tempBitmap.recycle()
                             }
                         }
-                        Log.d(TAG, "Bitmap created successfully for callback.");
-                        callback(bitmap)
-                    } else {
-                        Log.w(TAG, "acquireLatestImage returned null in listener despite onImageAvailable being called.");
-                        // Only call null callback if not already processed.
-                        // This state (onImageAvailable but acquireLatestImage is null) should be rare.
-                        if (!imageProcessed) callback(null)
-                    }
+                        // Log.d(TAG, "Bitmap created.")
+                        mainHandler.post { callback(bitmap) }
+                    } else { Log.w(TAG, "acquireLatestImage returned null.") }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error processing image in onImageAvailable listener", e)
-                    bitmap?.recycle() // Clean up potentially created bitmap on error
-                    if (!imageProcessed) callback(null) // Ensure callback if error before success
+                    Log.e(TAG, "Error processing image in listener", e)
+                    currentCaptureHandler.removeCallbacks(timeoutRunnable)
+                    bitmap?.recycle()
+                    if (isCurrentlyCapturingImage) mainHandler.post { callback(null) }
                 } finally {
-                    image?.close() // Must close the image
-                    // Crucially, remove the listener to prevent it from firing again for this capture session or leaking.
-                    reader.setOnImageAvailableListener(null, handler) // Use the same handler it was registered with, or null for main
-                    isCurrentlyCapturingImage = false // Reset capture flag
-                    Log.d(TAG, "Image processing finished in listener. Listener removed. isCurrentlyCapturingImage = false")
+                    image?.close()
+                    if (imageAcquired || !isCurrentlyCapturingImage) {
+                        isCurrentlyCapturingImage = false
+                        // Log.d(TAG, "Listener logic finished. isCurrentlyCapturingImage = false")
+                    }
                 }
             }
-        }, handler)
-
-        // Optional: Timeout for the capture operation
-        handler.postDelayed({
-            if (isCurrentlyCapturingImage) { // If still true, means onImageAvailable wasn't successfully processed
-                Log.w(TAG, "Capture timeout occurred. isCurrentlyCapturingImage is still true.")
-                currentImageReader.setOnImageAvailableListener(null, handler) // Clean up listener
-                isCurrentlyCapturingImage = false
-                callback(null) // Notify callback of failure
-            }
-        }, 3000) // 3-second timeout
+        }, currentCaptureHandler)
     }
 
-
     private fun releaseVirtualDisplayAndReader() {
-        virtualDisplay?.release()
+        // Log.d(TAG, "Releasing VirtualDisplay and ImageReader...")
+        try {
+            virtualDisplay?.release()
+        } catch (e: Exception) { Log.e(TAG, "Error releasing VirtualDisplay", e) }
         virtualDisplay = null
-        Log.d(TAG, "VirtualDisplay released.")
 
-        imageReader?.setOnImageAvailableListener(null, null) // Important to remove listener first
-        imageReader?.close()
+        try {
+            imageReader?.setOnImageAvailableListener(null, null)
+            imageReader?.close()
+        } catch (e: Exception) { Log.e(TAG, "Error closing ImageReader", e) }
         imageReader = null
-        Log.d(TAG, "ImageReader closed and released.")
+        // Log.d(TAG, "VirtualDisplay and ImageReader released.")
     }
 
     private fun releaseMediaProjection() {
-        mediaProjectionCallback?.let { cb ->
-            mediaProjection?.unregisterCallback(cb)
-            mediaProjectionCallback = null // Clear the reference
-            Log.d(TAG, "MediaProjection.Callback unregistered.")
+        // Log.d(TAG, "Releasing MediaProjection...")
+        mediaProjectionCallback?.let {
+            try { mediaProjection?.unregisterCallback(it) }
+            catch (e: Exception) { Log.e(TAG, "Error unregistering MP callback", e) }
+            mediaProjectionCallback = null
         }
-        mediaProjection?.stop()
+        try { mediaProjection?.stop() }
+        catch (e: Exception) { Log.e(TAG, "Error stopping MediaProjection", e) }
         mediaProjection = null
-        Log.d(TAG, "MediaProjection stopped and released.")
+        // Log.d(TAG, "MediaProjection released.")
     }
 
     private fun releaseAllCaptureResources() {
-        Log.d(TAG, "Releasing all screen capture resources.")
-        isCurrentlyCapturingImage = false // Stop any ongoing capture flag
+        Log.i(TAG, "Releasing all screen capture resources.")
+        isCurrentlyCapturingImage = false
+        captureHandler?.removeCallbacksAndMessages(null) // 핸들러 작업 취소
         releaseVirtualDisplayAndReader()
         releaseMediaProjection()
-        // isInitialized = false; // Do not reset isInitialized unless explicitly needed. displayMetrics might still be valid.
     }
 
     override fun stopCapture() {
-        Log.i(TAG, "stopCapture called externally. Releasing all resources.")
+        Log.i(TAG, "stopCapture called. Releasing resources and handler thread.")
         releaseAllCaptureResources()
+        captureHandlerThread?.quitSafely()
+        try {
+            captureHandlerThread?.join(500)
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Interrupted joining capture handler thread", e)
+            Thread.currentThread().interrupt()
+        }
+        captureHandlerThread = null
+        captureHandler = null
+        isInitialized = false // 다음 사용 시 재초기화
+        Log.d(TAG, "Capture HandlerThread stopped and manager reset.")
     }
 
     override fun isMediaProjectionReady(): Boolean {
-        return mediaProjection != null && virtualDisplay != null && imageReader != null && imageReader?.surface != null && imageReader!!.surface!!.isValid
+        val mpReady = mediaProjection != null
+        val vdReady = virtualDisplay != null
+        val irReady = imageReader?.surface?.isValid ?: false // surface null 체크 추가
+        return mpReady && vdReady && irReady
     }
 
-    override fun isCapturing(): Boolean {
-        return isCurrentlyCapturingImage
-    }
+    override fun isCapturing(): Boolean = isCurrentlyCapturingImage
 }

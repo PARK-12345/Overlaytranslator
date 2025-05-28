@@ -14,14 +14,15 @@ import com.example.overlaytranslator.domain.translation.TranslationManager
 import com.example.overlaytranslator.domain.translation.TranslationManagerImpl
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions // 기본 라틴 문자 인식기
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 // 필요에 따라 일본어, 한국어 인식기 옵션 import
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
+// import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions // 중국어 관련 주석 처리
 // 로거 관련 import 추가
 import com.example.overlaytranslator.domain.ocr.AppLogger
 import com.example.overlaytranslator.domain.ocr.AndroidLogger
-import dagger.Binds
+// import dagger.Binds // Binds 사용하지 않으므로 주석 처리 또는 제거 가능
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -73,7 +74,7 @@ object AppModule {
     @Singleton
     @Provides
     @Named("LatinRecognizer")
-    fun provideTextRecognizer(): TextRecognizer {
+    fun provideLatinTextRecognizer(): TextRecognizer {
         return TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 
@@ -91,11 +92,19 @@ object AppModule {
         return TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
     }
 
-    // AppLogger를 제공하는 @Provides 메소드 추가
+    /* // 중국어 인식기 제공 함수 주석 처리
+    @Singleton
+    @Provides
+    @Named("ChineseRecognizer")
+    fun provideChineseTextRecognizer(): TextRecognizer {
+        return TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+    }
+    */
+
     @Singleton
     @Provides
     fun provideAppLogger(): AppLogger {
-        return AndroidLogger() // AppLogger의 실제 구현체인 AndroidLogger 반환
+        return AndroidLogger()
     }
 
     @Singleton
@@ -104,16 +113,20 @@ object AppModule {
         @Named("LatinRecognizer") latinRecognizer: TextRecognizer,
         @Named("JapaneseRecognizer") japaneseRecognizer: TextRecognizer,
         @Named("KoreanRecognizer") koreanRecognizer: TextRecognizer,
-        settingsRepository: SettingsRepository, // ✨ 수정: SettingsRepository 의존성 추가
+        // @Named("ChineseRecognizer") chineseRecognizer: TextRecognizer, // 중국어 인식기 주입 부분 주석 처리
+        // settingsRepository: SettingsRepository, // OcrManagerImpl 생성자에서 제거됨
         appLogger: AppLogger
     ): OcrManager {
-        val recognizers = mapOf(
+        val recognizers = mutableMapOf( // mutableMap으로 변경하여 조건부 추가 가능하도록 함
             "latin" to latinRecognizer,
-            "ja" to japaneseRecognizer,
-            "ko" to koreanRecognizer
+            "japanese" to japaneseRecognizer,
+            "korean" to koreanRecognizer
+            // "chinese" 키로 chineseRecognizer를 추가하는 부분은 주석 처리된 상태 유지
         )
-        // ✨ 수정: OcrManagerImpl 생성 시 settingsRepository와 appLogger를 올바른 순서로 주입
-        return OcrManagerImpl(recognizers, settingsRepository, appLogger)
+        // 만약 ChineseRecognizer가 주입된다면 여기에 추가하는 로직이 있었을 것임
+        // 예: if (::chineseRecognizer.isInitialized) recognizers["chinese"] = chineseRecognizer
+
+        return OcrManagerImpl(recognizers.toMap(), appLogger) // toMap()으로 불변 맵 전달
     }
 
     @Singleton
@@ -127,9 +140,7 @@ object AppModule {
     fun provideIoDispatcher(): CoroutineDispatcher = Dispatchers.IO
 }
 
-// Qualifier 어노테이션 정의 (여러 TextRecognizer 인스턴스를 구분하기 위해)
-// 이 어노테이션은 사용자님의 기존 코드에 이미 정의되어 있으므로 그대로 유지합니다.
+// Qualifier 어노테이션 정의
 @javax.inject.Qualifier
 @Retention(AnnotationRetention.BINARY)
 annotation class Named(val value: String)
-

@@ -6,11 +6,11 @@
     <string name="title_activity_settings">설정</string>
 
     <string name="setting_section_translation_text_style">번역 텍스트 스타일</string>
-    <string name="setting_font_size">글꼴 크기</string>
-    <string name="setting_text_color">텍스트 색상</string>
-    <string name="setting_background_color">배경 색상</string>
+    <string name="setting_font_size">글꼴 크기 (sp, 비워두면 기본값)</string>
+    <string name="setting_text_color">텍스트 색상 (예: #FFFFFFFF)</string>
+    <string name="setting_background_color">배경 색상 (예: #80000000)</string>
     <string name="setting_background_alpha">배경 투명도 (0-255)</string>
-    <string name="setting_line_spacing">줄 간격</string>
+    <string name="setting_line_spacing">줄 간격 추가 값 (sp, 비워두면 기본값)</string>
     <string name="setting_text_alignment">텍스트 정렬</string>
     <string-array name="text_alignment_entries">
         <item>왼쪽</item>
@@ -23,40 +23,30 @@
         <item>RIGHT</item>
     </string-array>
 
-    <string name="setting_section_api">API 설정</string>
-    <string name="setting_gemini_api_key">Gemini API 키</string>
+    <string name="setting_section_api">API 설정 (Gemini)</string>
+    <string name="setting_gemini_api_key">API 키</string>
     <string name="setting_gemini_prompt">번역 지시 프롬프트</string>
-    <string name="default_gemini_prompt"></string>
-
-    <string name="setting_section_filter">필터링 설정</string>
-    <string name="setting_forbidden_keywords">금지 단어 (쉼표로 구분)</string>
-    <string name="setting_forbidden_keywords_hint">예: skip,log,auto</string>
-
-    <string name="setting_section_overlay_button">오버레이 버튼</string>
-    <string name="setting_button_size">버튼 크기 (dp)</string>
-    <string name="setting_capture_delay">캡처 지연 시간 (ms)</string>
-
-    <string name="setting_section_language">언어 설정</string>
+    <string name="default_gemini_prompt">This is OCR-extracted text.</string>
+    <string name="setting_gemini_model_name">모델 이름</string>
+    <string name="setting_thinking_budget_optional">Thinking Budget (선택 사항)</string> <string name="setting_temperature_optional">Temperature (0.0~1.0, 선택 사항)</string> <string name="setting_section_filter_cache">필터 및 캐시 설정</string> <string name="setting_forbidden_keywords">금지 단어 (쉼표로 구분)</string>
+    <string name="setting_forbidden_keywords_hint">예: 광고,홍보</string>
+    <string name="setting_similarity_tolerance">유사도 허용치 (0~5, 낮을수록 엄격)</string> <string name="setting_max_cache_size">최대 캐시 항목 수 (10~1000)</string> <string name="setting_section_overlay_button">오버레이 버튼</string>
+    <string name="setting_button_size_dp">버튼 크기 (dp)</string> <string name="setting_capture_delay_ms">캡처 지연 시간 (ms)</string> <string name="setting_section_language">언어 설정</string>
     <string name="setting_auto_detect_source_language">원본 언어 자동 감지</string>
-    <string name="setting_default_source_language">기본 원본 언어</string>
+    <string name="setting_default_source_language">기본 원본 언어 (자동 감지 해제 시)</string>
     <string-array name="source_language_entries">
         <item>일본어</item>
         <item>영어</item>
-        <item>한국어 (테스트용)</item>
-    </string-array>
-    <string-array name="source_language_values">
-        <item>ja</item>
+        <item>한국어</item> </string-array>
+    <string-array name="source_language_values"> <item>ja</item>
         <item>en</item>
         <item>ko</item>
     </string-array>
-    <string name="default_target_language">ko</string>
-
-    <string name="notification_channel_name">오버레이 서비스</string>
+    <string name="default_target_language">ko</string> <string name="notification_channel_name">오버레이 서비스</string>
     <string name="notification_channel_description">화면 번역 오버레이 서비스 실행 중</string>
     <string name="overlay_notification_title">오버레이 번역기 실행 중</string>
     <string name="overlay_notification_text">탭하여 설정을 변경하거나 중지하세요.</string>
-
-    <string name="error_permission_draw_overlay">다른 앱 위에 그리기 권한이 거부되었습니다. 앱을 사용하려면 권한을 허용해주세요.</string>
+    <string name="action_save_settings">설정 저장</string> <string name="action_stop_service">서비스 종료</string> <string name="error_permission_draw_overlay">다른 앱 위에 그리기 권한이 거부되었습니다. 앱을 사용하려면 권한을 허용해주세요.</string>
     <string name="permission_denied_notification">알림 권한이 거부되었습니다.</string>
     <string name="media_projection_request_title">화면 녹화/전송 시작</string>
     <string name="media_projection_request_text">화면 번역을 위해 화면 캡처를 시작합니다. 이 작업은 민감한 정보를 포함할 수 있습니다.</string>
@@ -83,9 +73,4 @@
     <string name="overlay_button_long_press_hint">길게 누르기: 버튼 이동</string>
     <string name="overlay_translations_hidden">번역 내용 숨김</string>
     <string name="overlay_translations_shown">번역 내용 표시</string>
-    <string name="setting_gemini_model_name">Gemini 모델 이름</string>
-    <string name="setting_thinking_budget">2.5 Flash 모델용 Thinking Budget 기본값:null</string>
-    <string name="setting_thinking_budget_hint">Thinking Budget</string>
-    <string name="setting_temperature">Temperature (생성 다양성)</string>
-
 </resources>
